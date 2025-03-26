@@ -1,89 +1,63 @@
-from flask import Flask, request, jsonify
 import pandas as pd
 import numpy as np
 import joblib
-import datetime
-import os
 import tensorflow as tf
-from tensorflow.keras.models import load_model
-from sklearn.preprocessing import MinMaxScaler
+from flask import Flask, request, jsonify
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
-# Load models and scalers
-def load_models_and_scalers():
-    models = {}
-    scalers = {}
-    currencies = ['US Dollar', 'Euro', 'Japanese Yen', 'Pound Sterling']
+# Load Models and Scalers
+models = {
+    "US Dollar": tf.keras.models.load_model("models/lstm_usd.h5"),
+    "Euro": tf.keras.models.load_model("models/lstm_euro.h5"),
+    "Japanese Yen": tf.keras.models.load_model("models/lstm_yen.h5"),
+    "Pound Sterling": tf.keras.models.load_model("models/lstm_pound.h5"),
+}
+
+scalers = {
+    "US Dollar": joblib.load("models/scaler_US Dollar.pkl"),
+    "Euro": joblib.load("models/scaler_Euro.pkl"),
+    "Japanese Yen": joblib.load("models/scaler_Japanese Yen.pkl"),
+    "Pound Sterling": joblib.load("models/scaler_Pound Sterling.pkl"),
+}
+
+# Function to make future predictions
+def predict_exchange_rates(days_to_predict=7):
+    last_known_date = datetime.today()  # Real-time date
+    future_dates = [last_known_date + timedelta(days=i+1) for i in range(days_to_predict)]
     
-    for currency in currencies:
-        try:
-            models[currency] = load_model(f'lstm_{currency.lower().replace(" ", "_")}.h5')
-            scalers[currency] = joblib.load(f'scaler_{currency}.pkl')
-        except Exception as e:
-            print(f"Error loading model or scaler for {currency}: {e}")
-    return models, scalers
-
-models, scalers = load_models_and_scalers()
-
-# Load dataset
-def load_dataset():
-    df = pd.read_csv("newdataset.csv")
-    df["date"] = pd.to_datetime(df["date"], format="%d-%m-%Y")
-    df = df.pivot(index="date", columns="currency_name", values="value")
-    df.bfill(inplace=True)
-    return df
-
-dataset = load_dataset()
-
-# Prediction function
-def predict_future_rates(days_to_predict=1):
-    last_date = dataset.index[-1]
-    future_dates = [last_date + datetime.timedelta(days=i+1) for i in range(days_to_predict)]
-    future_predictions = {}
-    
+    predictions = {}
     for currency, model in models.items():
-        scaled_data = scalers[currency].transform(dataset[[currency]])
-        seq_length = 30
-        last_sequence = scaled_data[-seq_length:].reshape(1, seq_length, 1)
+        scaler = scalers[currency]
         
+        # Load dataset to get last 30 days of data
+        df = pd.read_csv("dataset/newdataset.csv")
+        df["date"] = pd.to_datetime(df["date"], format="%d-%m-%Y")
+        df = df.pivot(index="date", columns="currency_name", values="value").bfill()
+        
+        # Scale and get the last sequence
+        scaled_data = scaler.transform(df[[currency]])
+        last_sequence = scaled_data[-30:].reshape(1, 30, 1)
+        
+        # Generate predictions
         curr_sequence = last_sequence.copy()
-        predictions = []
-        
+        future_rates = []
         for _ in range(days_to_predict):
             next_day_scaled = model.predict(curr_sequence)
-            next_day = scalers[currency].inverse_transform(next_day_scaled)[0][0]
-            predictions.append(next_day)
+            next_day = scaler.inverse_transform(next_day_scaled)[0][0]
+            future_rates.append(next_day)
             curr_sequence = np.append(curr_sequence[:, 1:, :], next_day_scaled.reshape(1, 1, 1), axis=1)
         
-        future_predictions[currency] = predictions
+        predictions[currency] = future_rates
     
-    results = pd.DataFrame(index=future_dates)
-    for currency in future_predictions:
-        results[currency] = future_predictions[currency]
-    
-    return results
+    return pd.DataFrame(predictions, index=future_dates).reset_index().rename(columns={"index": "Date"}).to_dict(orient="records")
 
-# API Route for prediction
-@app.route('/predict', methods=['GET'])
+@app.route("/predict", methods=["GET"])
 def predict():
-    days = request.args.get('days', default=1, type=int)
-    predictions = predict_future_rates(days_to_predict=days)
-    return jsonify(predictions.to_dict())
+    days = request.args.get("days", default=7, type=int)
+    results = predict_exchange_rates(days)
+    return jsonify(results)
 
-# API Route for updating models and scalers
-@app.route('/update', methods=['POST'])
-def update_models():
-    global dataset, models, scalers
-    dataset = load_dataset()
-    models, scalers = load_models_and_scalers()
-    return jsonify({"status": "Models and scalers updated successfully"})
-
-# API Route to check system status
-@app.route('/status', methods=['GET'])
-def status():
-    status_report = {"models_loaded": list(models.keys()), "dataset_last_date": str(dataset.index[-1])}
-    return jsonify(status_report)
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     app.run(debug=True)
